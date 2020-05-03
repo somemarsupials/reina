@@ -60,7 +60,7 @@ def fetch_all_comments():
     comments = []
     page_number = 1
 
-    while page_number < 2:
+    while True:
         list_source = get_comment_list_content(page_number)
         comment_urls = get_comment_urls_from_source(list_source)
 
@@ -68,7 +68,7 @@ def fetch_all_comments():
             print("FOUND EMPTY PAGE")
             break
 
-        for comment_url in comment_urls[:5]:
+        for comment_url in comment_urls:
             comment_source = get_comment_page_content(comment_url)
 
             comments.append(
