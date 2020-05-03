@@ -1,3 +1,5 @@
+import asyncio
+import aiohttp
 import csv
 from collections import Counter
 import requests
@@ -26,13 +28,6 @@ def get_comment_list_content(number):
     return response.text
 
 
-def get_comment_page_content(path):
-    url, query = path.split("?")
-    print("FETCHING COMMENT ID={}".format(url.split("/")[-1]))
-    response = requests.get(DOMAIN + path)
-    return response.content
-
-
 def get_comment_urls_from_source(source):
     tree = etree.fromstring(source, etree.HTMLParser())
     
@@ -56,9 +51,26 @@ def get_comment_text_from_source(source):
     return "".join(tree.xpath("".join(xpath_query)))
 
 
+async def async_fetch_comment(session, url):
+    async with session.get(DOMAIN + url) as response:
+        print("FETCHING COMMENT ID={}".format(url.split("?")[0].split("/")[-1]))
+        return await response.text()
+
+
+async def async_fetch_comments(comment_urls):
+    async with aiohttp.ClientSession() as session:
+        tasks = [
+            asyncio.ensure_future(async_fetch_comment(session, url))
+            for url in comment_urls
+            ]
+
+        return await asyncio.gather(*tasks)
+
+
 def fetch_all_comments():
     comments = []
     page_number = 1
+    loop = asyncio.get_event_loop()
 
     while True:
         list_source = get_comment_list_content(page_number)
@@ -68,12 +80,13 @@ def fetch_all_comments():
             print("FOUND EMPTY PAGE")
             break
 
-        for comment_url in comment_urls:
-            comment_source = get_comment_page_content(comment_url)
 
-            comments.append(
-                get_comment_text_from_source(comment_source)
-                )
+        comment_sources = loop.run_until_complete(
+            async_fetch_comments(comment_urls)
+            )
+
+        for source in comment_sources:
+            comments.append(get_comment_text_from_source(source))
 
         page_number += 1
 
