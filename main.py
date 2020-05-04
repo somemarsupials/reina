@@ -1,17 +1,71 @@
 import asyncio
 import aiohttp
-import csv
 from collections import Counter
-import requests
+import csv
 from lxml import etree
 import nltk
 
 DOMAIN = "https://community.shopify.com"
 PATH = "/c/forums/searchpage/tab/message"
 
-def get_comment_list_content(number):
-    print("FETCHING PAGE #{}...".format(number))
-    response = requests.get(DOMAIN + PATH, params={
+
+class RateLimitedRequests:
+    """Makes concurrent HTTP requests. Makes up to a fixed number of requests
+    at a time.
+    """
+
+    def __init__(self, semaphore):
+        self.semaphore = semaphore
+
+    @classmethod
+    def with_concurrency(cls, number):
+        """Return a client that makes up to `number` requests at a time""" 
+        return cls(asyncio.Semaphore(number))
+
+    async def get(self, url, **kwargs):
+        """Make an asynchronous HTTP GET request to `url`"""
+
+        async with self.semaphore:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url, **kwargs) as response:
+                    print("fetch {}".format(url.replace(DOMAIN, "")))
+
+                    return etree.fromstring(
+                        await response.text(),
+                        etree.HTMLParser()
+                        )
+
+
+def get_comment_urls_from_source(tree):
+    """Extract URLs to individual comments out of a page of comments"""
+
+    return tree.xpath(
+        "".join([
+            "//a[@class='page-link lia-link-navigation lia-custom-event']",
+            "/@href"
+            ])
+        )
+
+
+def get_comment_text_from_source(tree):
+    """Extract comment text from a comment page"""
+
+    comment_fragments = tree.xpath(
+        "".join([
+            "//div[@class='lia-component-topic-message']",
+            "//div[@class='lia-message-body-content']",
+            "/p/text()"
+            ])
+        )
+
+    return "".join(comment_fragments)
+
+
+async def fetch_comments_for_page(client, number):
+    """Get comment text for all comments on a page"""
+    print("fetching page #{}".format(number))
+
+    comment_list_source = await client.get(DOMAIN + PATH, params={
         "filter": "location,dateRangeType",
         "q": "review%20app",
         "noSynonym": "false",
@@ -24,76 +78,32 @@ def get_comment_list_content(number):
         "search_page_size": "50",
         "page": str(number)
         })
-    
-    return response.text
+
+    comment_sources = await asyncio.gather(*[
+        asyncio.ensure_future(client.get(DOMAIN + comment_url))
+        for comment_url in get_comment_urls_from_source(comment_list_source)
+        ])
+
+    return [get_comment_text_from_source(s) for s in comment_sources]
 
 
-def get_comment_urls_from_source(source):
-    tree = etree.fromstring(source, etree.HTMLParser())
-    
-    xpath_query = [
-        "//a[@class='page-link lia-link-navigation lia-custom-event']",
-        "/@href"
-        ]
+async def fetch_all_comments(client, page_number=1, comments=[]):
+    """Get comment text for all comment pages"""
+    page_comments = await fetch_comments_for_page(client, page_number)
 
-    return tree.xpath("".join(xpath_query))
+    if not page_comments:
+        return comments
 
-
-def get_comment_text_from_source(source):
-    tree = etree.fromstring(source, etree.HTMLParser())
-
-    xpath_query = [
-        "//div[@class='lia-component-topic-message']",
-        "//div[@class='lia-message-body-content']",
-        "/p/text()"
-        ]
-
-    return "".join(tree.xpath("".join(xpath_query)))
-
-
-async def async_fetch_comment(session, url):
-    async with session.get(DOMAIN + url) as response:
-        print("FETCHING COMMENT ID={}".format(url.split("?")[0].split("/")[-1]))
-        return await response.text()
-
-
-async def async_fetch_comments(comment_urls):
-    async with aiohttp.ClientSession() as session:
-        tasks = [
-            asyncio.ensure_future(async_fetch_comment(session, url))
-            for url in comment_urls
-            ]
-
-        return await asyncio.gather(*tasks)
-
-
-def fetch_all_comments():
-    comments = []
-    page_number = 1
-    loop = asyncio.get_event_loop()
-
-    while True:
-        list_source = get_comment_list_content(page_number)
-        comment_urls = get_comment_urls_from_source(list_source)
-
-        if not comment_urls:
-            print("FOUND EMPTY PAGE")
-            break
-
-
-        comment_sources = loop.run_until_complete(
-            async_fetch_comments(comment_urls)
-            )
-
-        for source in comment_sources:
-            comments.append(get_comment_text_from_source(source))
-
-        page_number += 1
-
-    return comments
+    return await fetch_all_comments(
+        client,
+        page_number + 1,
+        [*comments, *page_comments]
+        )
 
 
 def comments_to_word_counts(comments):
+    """Convert a comment into a word count"""
+
     # need to download tokenizer resources!
     nltk.download("punkt")
 
@@ -106,6 +116,8 @@ def comments_to_word_counts(comments):
 
 
 def counts_to_csv(counts):
+    """Persist word counts as a CSV file"""
+
     with open("./word_counts.csv", "w") as destination:
         writer = csv.writer(destination)
         writer.writerow(["Word", "Count"])
@@ -114,5 +126,11 @@ def counts_to_csv(counts):
             writer.writerow(pair)
 
 
-counts = comments_to_word_counts(fetch_all_comments())
-counts_to_csv(counts)
+if __name__ == "__main__":
+    client = RateLimitedRequests.with_concurrency(10)
+    comments = asyncio.get_event_loop().run_until_complete(
+        fetch_all_comments(client)
+        )
+
+    counts = comments_to_word_counts(comments)
+    counts_to_csv(counts)
