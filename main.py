@@ -1,83 +1,66 @@
-import asyncio
-import aiohttp
 from collections import Counter
 import csv
 from lxml import etree
-import nltk
+import requests
+import string
 
 DOMAIN = "https://community.shopify.com"
 PATH = "/c/forums/searchpage/tab/message"
 
-
-class RateLimitedRequests:
-    def __init__(self, semaphore):
-        self.semaphore = semaphore
-
-    @classmethod
-    def with_concurrency(cls, number):
-        return cls(asyncio.Semaphore(number))
-
-    async def get(self, url, **kwargs):
-        async with self.semaphore:
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url, **kwargs) as response:
-                    return await response.text()
+def parse_page_source_into_element_tree(source):
+    return etree.fromstring(source, etree.HTMLParser())
 
 
-class CommentListPage:
-    def __init__(self, tree):
-        self.tree = tree
+def get_comment_urls_from_comment_list_page(source):
+    element_tree = parse_page_source_into_element_tree(source)
 
-    @classmethod
-    def from_source(cls, source):
-        return cls(etree.fromstring(source, etree.HTMLParser()))
+    xpath_query_parts = [
+        # get anchors with class "page-link lia-link-navigation lia-custom-event"
+        # anchor == a in HTML
+        "//a[@class='page-link lia-link-navigation lia-custom-event']",
+        # get href property from matching elements
+        "/@href"
+        ]
 
-    def get_comment_urls(self):
-        return self.tree.xpath(
-            "".join([
-                "//a[@class='page-link lia-link-navigation lia-custom-event']",
-                "/@href"
-                ])
-            )
+    # use join to combine query parts into a single query string
+    return element_tree.xpath("".join(xpath_query_parts))
 
 
-class CommentPage:
-    def __init__(self, tree):
-        self.tree = tree
+def get_comment_content_from_comment_page(source):
+    element_tree = parse_page_source_into_element_tree(source)
 
-    @classmethod
-    def from_source(cls, source):
-        return cls(etree.fromstring(source, etree.HTMLParser()))
+    xpath_query_parts = [
+        # get divs with class "lia-component-topic-message"
+        "//div[@class='lia-component-topic-message']",
+        # get any div within these with class "lia-component-body-content"
+        "//div[@class='lia-message-body-content']",
+        # get paragraphs within these
+        # paragraph == p in HTML
+        "/p",
+        # get text content of paragraphs
+        "/text()"
+        ]
 
-    def get_comment_content(self):
-        comment_fragments = self.tree.xpath(
-            "".join([
-                "//div[@class='lia-component-topic-message']",
-                "//div[@class='lia-message-body-content']",
-                "/p/text()"
-                ])
-            )
-
-        return "".join(comment_fragments)
-
-
-async def fetch_comment_source(client, url):
-    return await client.get(DOMAIN + url)
+    # use join to combine query parts into a single query string
+    paragraphs = element_tree.xpath("".join(xpath_query_parts))
+    return "".join(paragraphs)
 
 
-async def fetch_comments(client, urls):
-    tasks = [fetch_comment_source(client, url) for url in urls]
+def fetch_comment_from_url(comment_url):
+    print("fetching {}".format(comment_url))
 
-    return map(
-        lambda source: CommentPage.from_source(source).get_comment_content(),
-        await asyncio.gather(*tasks)
-        )
+    comment_source = requests.get(DOMAIN + comment_url).text
+    return get_comment_content_from_comment_page(comment_source)
 
 
-async def fetch_comments_for_page(client, number):
+def fetch_comments_from_urls(comment_urls):
+    return [fetch_comment_from_url(url) for url in comment_urls]
+
+
+def fetch_all_comments_for_page(number):
     print("fetching page #{}".format(number))
 
-    source = client.get(DOMAIN + PATH, params={
+    response = requests.get(DOMAIN + PATH, params={
         "filter": "location,dateRangeType",
         "q": "review%20app",
         "noSynonym": "false",
@@ -91,36 +74,37 @@ async def fetch_comments_for_page(client, number):
         "page": str(number)
         })
 
-    return await fetch_comments(
-        client,
-        CommentListPage.from_source(await source).get_comment_urls()
-        )
+    comment_urls = get_comment_urls_from_comment_list_page(response.text)
+    return fetch_comments_from_urls(comment_urls)
 
 
-async def fetch_all_comments(client, page_number=1, comments=[]):
-    """Get comment text for all comment pages"""
-    page_comments = list(await fetch_comments_for_page(client, page_number))
+def fetch_all_comments(page_num=1, all_comments=[]):
+    new_comments = fetch_all_comments_for_page(page_num)
 
-    if not page_comments:
-        return comments
+    if not new_comments:
+        return all_comments
 
-    return await fetch_all_comments(
-        client,
-        page_number + 1,
-        [*comments, *page_comments]
-        )
+    # note that we use recursion here!
+    # this makes the code cleaner because we don't need a while loop
+    return fetch_all_comments(page_num + 1, all_comments + new_comments)
+
+
+def remove_punctuation_and_lowercase(word):
+    # use translate to remove punctuation
+    # https://stackoverflow.com/questions/265960/best-way-to-strip-punctuation-from-a-string
+    return word.lower().translate(word.maketrans("", "", string.punctuation))
 
 
 def comments_to_word_counts(comments):
-    # need to download tokenizer resources!
-    nltk.download("punkt")
+    # note use of double loop in list comprehension
+    raw_words = [word for comment in comments for word in comment.split()]
 
-    raw_words = [
-        word.lower() for c in comments
-        for word in nltk.tokenize.word_tokenize(c)
+    processed_words = [
+        remove_punctuation_and_lowercase(word)
+        for word in raw_words if len(word) > 0 and word.isalpha()
         ]
 
-    return Counter(filter(str.isalpha, raw_words))
+    return Counter(processed_words)
 
 
 def counts_to_csv(counts):
@@ -133,10 +117,6 @@ def counts_to_csv(counts):
 
 
 if __name__ == "__main__":
-    client = RateLimitedRequests.with_concurrency(10)
-    comments = asyncio.get_event_loop().run_until_complete(
-        fetch_all_comments(client)
-        )
-
+    comments = fetch_all_comments()
     counts = comments_to_word_counts(comments)
     counts_to_csv(counts)
